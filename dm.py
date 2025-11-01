@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo
 from pyrogram.enums import MessagesFilter
 from utils.misc import modules_help, prefix
 from utils.db import db
@@ -154,9 +154,9 @@ async def media_slot(client: Client, message: Message):
         for msg_id in saved["media_group"]:
             msg = await client.get_messages(chat_id, msg_id)
             if msg.photo:
-                msgs.append({"type": "photo", "media": msg.photo.file_id, "caption": msg.caption or ""})
+                msgs.append(InputMediaPhoto(msg.photo.file_id, caption=msg.caption or ""))
             elif msg.video:
-                msgs.append({"type": "video", "media": msg.video.file_id, "caption": msg.caption or ""})
+                msgs.append(InputMediaVideo(msg.video.file_id, caption=msg.caption or ""))
         if msgs:
             await client.send_media_group(message.chat.id, msgs)
             await message.delete()
