@@ -10,7 +10,7 @@ import google.generativeai as genai
 genai.configure(api_key=gemini_key)
 MODEL_NAME = "gemini-2.0-flash"
 COOK_GEN_CONFIG = {
-    "temperature": 0.35, "top_p": 0.95, "top_k": 40, "max_output_tokens": 1024
+"temperature": 0.35, "top_p": 0.95, "top_k": 40, "max_output_tokens": 1024
 }
 
 def _valid_file(reply, file_type=None):
@@ -28,7 +28,8 @@ def _valid_file(reply, file_type=None):
     )
 
 async def _upload_file(file_path, file_type):
-    uploaded_file = genai.upload_file(file_path)
+    mime = "video/mp4" if file_type == "video" else None  # FIX for videos
+    uploaded_file = genai.upload_file(file_path, mime_type=mime)
     while uploaded_file.state.name == "PROCESSING":
         await asyncio.sleep(5)
         uploaded_file = genai.get_file(uploaded_file.name)
@@ -37,38 +38,54 @@ async def _upload_file(file_path, file_type):
     return uploaded_file
 
 async def prepare_input_data(reply, file_path, prompt):
+    # FIXED: Convert Telegram images to clean JPEG → upload → pass to Gemini
     if reply.photo:
-        with Image.open(file_path) as img:
-            img.verify()
-            return [prompt, img]
+        fixed_path = file_path + "_fixed.jpg"
+        try:
+            img = Image.open(file_path).convert("RGB")
+            img.save(fixed_path, "JPEG")
+            uploaded = await _upload_file(fixed_path, "image")
+            return [prompt, uploaded]   # FIXED: return uploaded file, not local path
+        except Exception:
+            raise ValueError("Invalid or corrupted image file.")
+
     if reply.video or reply.video_note:
         return [prompt, await _upload_file(file_path, "video")]
+
     if reply.audio or reply.voice:
         return [await _upload_file(file_path, "audio"), prompt]
+
     if reply.document and file_path.endswith(".pdf"):
         return [prompt, await _upload_file(file_path, "PDF")]
+
     if reply.document:
         return [await _upload_file(file_path, "document"), prompt]
+
     raise ValueError("Unsupported file type")
 
 async def ai_process_handler(message, prompt, show_prompt=False, cook_mode=False, expect_type=None, status_msg="Processing..."):
     reply = message.reply_to_message
     if not reply:
         usage_hint = f"<b>Usage:</b> <code>{prefix}{message.command[0]} [prompt]</code> [Reply to a file]" if expect_type is None else \
-            f"<b>Usage:</b> <code>{prefix}{message.command[0]} [custom prompt]</code> [Reply to a {expect_type}]"
+        f"<b>Usage:</b> <code>{prefix}{message.command[0]} [custom prompt]</code> [Reply to a {expect_type}]"
         return await message.edit_text(usage_hint)
+
     if not _valid_file(reply, file_type=expect_type):
         type_text = expect_type if expect_type else "supported"
         return await message.edit_text(f"<code>Invalid {type_text} file. Please try again.</code>")
+
     await message.edit_text(f"<code>{status_msg}</code>")
+
     file_path = await reply.download()
     if not file_path or not os.path.exists(file_path):
         return await message.edit_text("<code>Failed to process the file. Try again.</code>")
+
     try:
         input_data = await prepare_input_data(reply, file_path, prompt)
         model = genai.GenerativeModel(
             MODEL_NAME, generation_config=COOK_GEN_CONFIG if cook_mode else None
         )
+
         for _ in range(3):
             try:
                 response = model.generate_content(input_data)
@@ -90,13 +107,17 @@ async def ai_process_handler(message, prompt, show_prompt=False, cook_mode=False
                     raise
         else:
             raise e
-        result_text = (f"**Prompt:** {prompt}\n" if show_prompt else "") + f"**Answer:** {getattr(response, 'text', '') or '<code>No content generated.</code>'}"
+
+        result_text = (f"**Prompt:** {prompt}\n" if show_prompt else "") + \
+                      f"**Answer:** {getattr(response, 'text', '') or '<code>No content generated.</code>'}"
+
         if len(result_text) > 4000:
             for i in range(0, len(result_text), 4000):
                 await message.reply_text(result_text[i:i+4000], parse_mode=enums.ParseMode.MARKDOWN)
             await message.delete()
         else:
             await message.edit_text(result_text, parse_mode=enums.ParseMode.MARKDOWN)
+
     except ValueError as e:
         await message.edit_text(f"<code>{str(e)}</code>")
     except Exception as e:
@@ -154,9 +175,9 @@ async def pr_command(_, message):
     await ai_process_handler(message, prompt, show_prompt=show_prompt)
 
 modules_help["generative"] = {
-    "getai [custom prompt] [reply to image]*": "Analyze an image using AI.",
-    "aicook [reply to image]*": "Identify food and generate cooking instructions.",
-    "aiseller [target audience] [reply to image]*": "Generate marketing descriptions for products.",
-    "transcribe [custom prompt] [reply to audio/video]*": "Transcribe or summarize an audio or video file.",
-    "process [prompt] [reply to any file]*": "Process any file (image, audio, video, video note, PDF, document, code, etc).",
+"getai [custom prompt] [reply to image]": "Analyze an image using AI.",
+"aicook [reply to image]": "Identify food and generate cooking instructions.",
+"aiseller [target audience] [reply to image]": "Generate marketing descriptions for products.",
+"transcribe [custom prompt] [reply to audio/video]": "Transcribe or summarize an audio or video file.",
+"process [prompt] [reply to any file]*": "Process any file (image, audio, video, video note, PDF, document, code, etc).",
 }
