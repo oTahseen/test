@@ -6,7 +6,6 @@ from utils.misc import modules_help, prefix
 from utils.scripts import format_exc
 from utils.config import gemini_key
 import google.generativeai as genai
-import io
 
 genai.configure(api_key=gemini_key)
 MODEL_NAME = "gemini-2.0-flash"
@@ -16,84 +15,67 @@ COOK_GEN_CONFIG = {
 
 def _valid_file(reply, file_type=None):
     if file_type == "image":
-        return bool(reply.photo)
-    if file_type == "audio":
-        return bool(reply.audio or reply.voice)
-    if file_type == "video":
-        return bool(reply.video or reply.video_note)
-    return any([
-        reply.photo, reply.audio, reply.voice,
-        reply.video, reply.video_note, reply.document
-    ])
+        return getattr(reply, "photo", None) is not None
+    if file_type in {"audio", "video"}:
+        return any(getattr(reply, attr, False) for attr in ("audio", "voice", "video", "video_note"))
+    return (
+        getattr(reply, "photo", None)
+        or getattr(reply, "audio", None)
+        or getattr(reply, "voice", None)
+        or getattr(reply, "video", None)
+        or getattr(reply, "video_note", None)
+        or getattr(reply, "document", None)
+    )
 
 async def _upload_file(file_path, file_type):
     uploaded_file = genai.upload_file(file_path)
-    for _ in range(12):
-        if uploaded_file.state.name == "PROCESSING":
-            await asyncio.sleep(5)
-            uploaded_file = genai.get_file(uploaded_file.name)
-        else:
-            break
+    while uploaded_file.state.name == "PROCESSING":
+        await asyncio.sleep(5)
+        uploaded_file = genai.get_file(uploaded_file.name)
     if uploaded_file.state.name == "FAILED":
         raise ValueError(f"{file_type.capitalize()} failed to process")
     return uploaded_file
 
 async def prepare_input_data(reply, file_path, prompt):
     if reply.photo:
-        try:
-            with Image.open(file_path) as img:
-                img.verify()
-            img = Image.open(file_path).convert("RGB")
+        with Image.open(file_path) as img:
+            img.verify()
             return [prompt, img]
-        except Exception:
-            with open(file_path, "rb") as f:
-                raw = f.read()
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-            return [prompt, img]
-
     if reply.video or reply.video_note:
         return [prompt, await _upload_file(file_path, "video")]
-
     if reply.audio or reply.voice:
         return [await _upload_file(file_path, "audio"), prompt]
-
     if reply.document and file_path.endswith(".pdf"):
         return [prompt, await _upload_file(file_path, "PDF")]
-
     if reply.document:
         return [await _upload_file(file_path, "document"), prompt]
-
     raise ValueError("Unsupported file type")
 
 async def ai_process_handler(message, prompt, show_prompt=False, cook_mode=False, expect_type=None, status_msg="Processing..."):
     reply = message.reply_to_message
     if not reply:
-        usage_hint = (
-            f"<b>Usage:</b> <code>{prefix}{message.command[0]} [prompt]</code> [Reply to a file]"
-            if expect_type is None else
+        usage_hint = f"<b>Usage:</b> <code>{prefix}{message.command[0]} [prompt]</code> [Reply to a file]" if expect_type is None else \
             f"<b>Usage:</b> <code>{prefix}{message.command[0]} [custom prompt]</code> [Reply to a {expect_type}]"
-        )
         return await message.edit_text(usage_hint)
-
     if not _valid_file(reply, file_type=expect_type):
         type_text = expect_type if expect_type else "supported"
         return await message.edit_text(f"<code>Invalid {type_text} file. Please try again.</code>")
-
     await message.edit_text(f"<code>{status_msg}</code>")
-
-    file_path = await reply.download(file_name="input_file")
+    file_path = await reply.download()
     if not file_path or not os.path.exists(file_path):
         return await message.edit_text("<code>Failed to process the file. Try again.</code>")
-
     try:
         input_data = await prepare_input_data(reply, file_path, prompt)
-        model = genai.GenerativeModel(MODEL_NAME, generation_config=COOK_GEN_CONFIG if cook_mode else None)
-
+        model = genai.GenerativeModel(
+            MODEL_NAME, generation_config=COOK_GEN_CONFIG if cook_mode else None
+        )
         for _ in range(3):
             try:
                 response = model.generate_content(input_data)
+
                 if not getattr(response, "candidates", []):
                     return await message.edit_text("<code>Empty response, try again.</code>")
+
                 break
             except Exception as e:
                 msg = str(e).lower()
@@ -108,26 +90,21 @@ async def ai_process_handler(message, prompt, show_prompt=False, cook_mode=False
                     raise
         else:
             raise e
-
         result_text = (f"**Prompt:** {prompt}\n" if show_prompt else "") + f"**Answer:** {getattr(response, 'text', '') or '<code>No content generated.</code>'}"
-
         if len(result_text) > 4000:
             for i in range(0, len(result_text), 4000):
                 await message.reply_text(result_text[i:i+4000], parse_mode=enums.ParseMode.MARKDOWN)
             await message.delete()
         else:
             await message.edit_text(result_text, parse_mode=enums.ParseMode.MARKDOWN)
-
     except ValueError as e:
         await message.edit_text(f"<code>{str(e)}</code>")
     except Exception as e:
         await message.edit_text(f"<code>Error:</code> {format_exc(e)}")
     finally:
         if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+            try: os.remove(file_path)
+            except Exception: pass
 
 @Client.on_message(filters.command("getai", prefix) & filters.me)
 async def getai(_, message):
@@ -138,16 +115,14 @@ async def getai(_, message):
     )
     await ai_process_handler(
         message, prompt, show_prompt=len(message.command) > 1,
-        expect_type="image", status_msg="Scanning..."
-    )
+        expect_type="image", status_msg="Scanning...")
 
 @Client.on_message(filters.command("aicook", prefix) & filters.me)
 async def aicook(_, message):
     await ai_process_handler(
         message,
         "Identify the baked good in the image and provide an accurate recipe.",
-        cook_mode=True, expect_type="image", status_msg="Cooking..."
-    )
+        cook_mode=True, expect_type="image", status_msg="Cooking...")
 
 @Client.on_message(filters.command("aiseller", prefix) & filters.me)
 async def aiseller(_, message):
@@ -169,8 +144,7 @@ async def transcribe(_, message):
     )
     await ai_process_handler(
         message, prompt, show_prompt=len(message.command) > 1,
-        expect_type="audio", status_msg="Transcribing..."
-    )
+        expect_type="audio", status_msg="Transcribing...")
 
 @Client.on_message(filters.command(["process", "pr"], prefix) & filters.me)
 async def pr_command(_, message):
@@ -180,9 +154,9 @@ async def pr_command(_, message):
     await ai_process_handler(message, prompt, show_prompt=show_prompt)
 
 modules_help["generative"] = {
-    "getai [custom prompt] [reply to image]": "Analyze an image using AI.",
-    "aicook [reply to image]": "Identify food and generate cooking instructions.",
-    "aiseller [target audience] [reply to image]": "Generate marketing descriptions for products.",
-    "transcribe [custom prompt] [reply to audio/video]": "Transcribe or summarize an audio or video file.",
+    "getai [custom prompt] [reply to image]*": "Analyze an image using AI.",
+    "aicook [reply to image]*": "Identify food and generate cooking instructions.",
+    "aiseller [target audience] [reply to image]*": "Generate marketing descriptions for products.",
+    "transcribe [custom prompt] [reply to audio/video]*": "Transcribe or summarize an audio or video file.",
     "process [prompt] [reply to any file]*": "Process any file (image, audio, video, video note, PDF, document, code, etc).",
 }
